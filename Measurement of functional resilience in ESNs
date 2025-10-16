@@ -1,0 +1,153 @@
+# ============================================================================
+#  Eco-Spatial Network Functional-Resilience Assessment
+#  Author:  DengZhiwei123
+#  GitHub:  https://github.com/DengZhiwei123/Measurement of functional resilience in ESNs
+# ============================================================================
+
+# -------------------------- 0.  PACKAGES ------------------------------------
+library(readxl)
+library(igraph)
+library(dplyr)
+library(ggplot2)
+library(openxlsx)
+
+# -------------------------- 1.  FILE PATHS ----------------------------------
+# >>>  Replace with your own paths  <<<
+edge_file   <- "YOUR_PATH/edges.xlsx"
+node_file   <- "YOUR_PATH/nodes.xlsx"
+out_dir     <- "YOUR_OUTPUT_FOLDER"
+dir.create(out_dir, showWarnings = FALSE)
+
+# -------------------------- 2.  LOAD DATA & BUILD GRAPH ---------------------
+edges_data <- read_excel(edge_file)
+nodes_data <- read_excel(node_file)
+
+g <- graph_from_data_frame(d = edges_data, directed = FALSE, vertices = nodes_data)
+E(g)$weight <- edges_data$weight
+total_nodes <- vcount(g)
+
+# -------------------------- 3.  CENTRALITY METRICS --------------------------
+w_deg  <- strength(g, mode = "all", weights = E(g)$weight)
+w_btw  <- betweenness(g, directed = FALSE, weights = 1/E(g)$weight, normalized = FALSE)
+w_cls  <- closeness(g, mode = "all", weights = 1/E(g)$weight, normalized = TRUE)
+w_eig  <- eigen_centrality(g, directed = FALSE, weights = E(g)$weight, scale = TRUE)$vector
+
+# -------------------------- 4.  NORMALISE & ENTROPY WEIGHTS -----------------
+min_max <- function(x){
+  if(all(is.na(x))) return(rep(0, length(x)))
+  (x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))
+}
+node_df <- data.frame(ID_Node = nodes_data$ID_Node,
+                      W_Deg = min_max(w_deg),
+                      W_Btw = min_max(w_btw),
+                      W_Cls = w_cls,
+                      W_Eig = w_eig)
+
+mat <- node_df %>% select(-ID_Node) %>% as.matrix()
+entropy_weights <- function(m){
+  m[is.na(m)] <- 0
+  p <- apply(m, 2, function(col) (col + 1e-10) / sum(col + 1e-10))
+  ent <- apply(p, 2, function(col) -sum(col * log(col)) / log(nrow(m)))
+  util <- 1 - ent
+  util / sum(util)
+}
+w <- entropy_weights(mat)
+node_df$EntropyScore <- mat %*% w
+node_df <- node_df %>% arrange(desc(EntropyScore))
+
+# -------------------------- 5.  FUNCTIONAL-RESILIENCE METRICS ---------------
+# Weighted global efficiency
+wge <- function(gr){
+  if(vcount(gr) < 2) return(0)
+  sp <- distances(gr, weights = 1/E(gr)$weight)
+  eff <- 1/sp; eff[is.infinite(eff)] <- 0
+  sum(eff) / (vcount(gr) * (vcount(gr) - 1))
+}
+
+# Weighted clustering coefficient
+wclust <- function(gr){
+  if(vcount(gr) == 0) return(0)
+  cw <- numeric(vcount(gr))
+  for(i in V(gr)){
+    nb <- neighbors(gr, i)
+    if(length(nb) < 2){cw[i] <- 0; next}
+    w_i <- sapply(nb, function(j) E(gr)[i %--% j]$weight)
+    num <- 0
+    for(j in 1:(length(nb)-1)){
+      for(k in (j+1):length(nb)){
+        w_jk <- E(gr)[nb[j] %--% nb[k]]$weight
+        if(length(w_jk) == 0) w_jk <- 0
+        num <- num + w_i[j]*w_i[k]*w_jk
+      }
+    }
+    den <- sum(w_i)^2 - sum(w_i^2)
+    cw[i] <- ifelse(den > 0, num/den, 0)
+  }
+  mean(cw, na.rm = TRUE)
+}
+
+# -------------------------- 6.  ATTACK SIMULATIONS --------------------------
+attack_sequence <- node_df$ID_Node         # importance-based (high → low)
+hq_sequence     <- nodes_data %>% arrange(HQ) %>% pull(ID_Node)  # HQ-based (low → high)
+
+simulate <- function(sequence, mode_name){
+  gr <- g
+  res <- tibble(
+    Removed_Node = character(),
+    FuncRes      = numeric(),
+    GlobEff      = numeric(),
+    ClustCoeff   = numeric(),
+    RemHQArea    = numeric(),
+    Mode         = character()
+  )
+  for(node in sequence){
+    if(!node %in% V(gr)$name) next
+    gr <- delete_vertices(gr, V(gr)$name == node)
+    rem_ids <- V(gr)$name
+    hq_area <- sum(nodes_data$HQ[match(rem_ids, nodes_data$ID_Node)] *
+                   nodes_data$area[match(rem_ids, nodes_data$ID_Node)])
+    eff  <- wge(gr)
+    clust <- wclust(gr)
+    func_r <- hq_area * eff * clust
+    res <- add_row(res,
+                   Removed_Node = node,
+                   FuncRes      = func_r,
+                   GlobEff      = eff,
+                   ClustCoeff   = clust,
+                   RemHQArea    = hq_area,
+                   Mode         = mode_name)
+    if(vcount(gr) == 0) break
+  }
+  return(res %>% mutate(RemovalRatio = row_number() / total_nodes))
+}
+
+res_imp <- simulate(attack_sequence, "Importance")
+res_hq  <- simulate(hq_sequence, "HQ_Ascending")
+
+# -------------------------- 7.  SAVE & PLOT ---------------------------------
+write.xlsx(res_imp, file.path(out_dir, "Resilience_Importance.xlsx"), rowNames = FALSE)
+write.xlsx(res_hq,  file.path(out_dir, "Resilience_HQ.xlsx"),       rowNames = FALSE)
+
+comb <- bind_rows(res_imp, res_hq) %>% 
+  mutate(NormFuncRes = (FuncRes - min(FuncRes)) / (max(FuncRes) - min(FuncRes)))
+
+p <- ggplot(comb, aes(RemovalRatio, NormFuncRes, colour = Mode)) +
+     geom_line(size = 1) +
+     labs(x = "Node removal ratio", y = "Normalised functional resilience",
+          title = "Functional-resilience curves under two attack strategies") +
+     scale_colour_manual(values = c("Importance" = "steelblue", "HQ_Ascending" = "firebrick")) +
+     theme_bw(base_size = 14)
+
+ggsave(filename = file.path(out_dir, "FuncRes_Curves.png"), plot = p, width = 6, height = 4, dpi = 300)
+
+# -------------------------- 8.  AUC SUMMARY ---------------------------------
+calc_auc <- function(df){
+  x <- df$RemovalRatio
+  y <- (df$FuncRes - min(df$FuncRes)) / (max(df$FuncRes) - min(df$FuncRes))
+  ord <- order(x)
+  sum(diff(x[ord]) * (head(y[ord], -1) + tail(y[ord], -1)) / 2)
+}
+auc_tbl <- tibble(Method = c("Importance", "HQ_Ascending"),
+                  AUC    = round(c(calc_auc(res_imp), calc_auc(res_hq)), 4))
+write.xlsx(auc_tbl, file.path(out_dir, "AUC_Summary.xlsx"), rowNames = FALSE)
+print(auc_tbl)
