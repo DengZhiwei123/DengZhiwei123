@@ -1,0 +1,169 @@
+# ============================================================================
+#  Network Structural Resilience Assessment
+#  Author:  Zhi-Wei Deng
+#  License: MIT
+#  GitHub:  https://github.com/DengZhiwei123/Measurement of structural resilience in Ecological Spatial Networks (ESNs)
+# ============================================================================
+
+# -------------------------- 0.  PACKAGES ------------------------------------
+library(readxl)
+library(igraph)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(openxlsx)
+
+# -------------------------- 1.  FILE PATHS ----------------------------------
+# >>>  Replace with your own paths  <<<
+edge_file      <- "YOUR_PATH/edges.xlsx"
+node_file      <- "YOUR_PATH/nodes.xlsx"
+output_dir     <- "YOUR_OUTPUT_FOLDER"   # folder for results
+dir.create(output_dir, showWarnings = FALSE)
+
+# -------------------------- 2.  LOAD DATA -----------------------------------
+edges_data <- read_excel(edge_file)
+nodes_data <- read_excel(node_file)
+
+# -------------------------- 3.  BUILD GRAPH ---------------------------------
+g <- graph_from_data_frame(d = edges_data,
+                           directed = FALSE,
+                           vertices = nodes_data)
+E(g)$weight <- edges_data$weight
+
+total_nodes <- vcount(g)               # store original size
+cat("Initial nodes:", total_nodes, "\n")
+
+# -------------------------- 4.  CENTRALITY METRICS --------------------------
+weighted_degree  <- strength(g, mode = "all", weights = E(g)$weight)
+btw_weighted     <- betweenness(g, directed = FALSE,
+                                weights = 1/E(g)$weight, normalized = FALSE)
+close_weighted   <- closeness(g, mode = "all",
+                              weights = 1/E(g)$weight, normalized = TRUE)
+eigen_weighted   <- eigen_centrality(g, directed = FALSE,
+                                    weights = E(g)$weight, scale = TRUE)$vector
+
+# -------------------------- 5.  NORMALISE & COMBINE -------------------------
+normalize <- function(x){
+  if(all(is.na(x))) return(rep(0, length(x)))
+  (x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))
+}
+
+node_importance <- data.frame(
+  ID_Node     = nodes_data$ID_Node,
+  W_Degree    = normalize(weighted_degree),
+  Betweenness = normalize(btw_weighted),
+  Closeness   = close_weighted,          # already [0,1]
+  Eigenvector = eigen_weighted           # already [0,1]
+)
+
+# -------------------------- 6.  ENTROPY WEIGHTS -----------------------------
+metrics <- node_importance %>% select(W_Degree, Betweenness, Closeness, Eigenvector) %>% as.matrix()
+
+entropy_weights <- function(mat){
+  mat[is.na(mat)] <- 0
+  p_mat <- apply(mat, 2, function(col){
+    col_adj <- col + 1e-10
+    col_adj / sum(col_adj)
+  })
+  entropy <- apply(p_mat, 2, function(col){
+    -sum(col * log(col)) / log(nrow(mat))
+  })
+  utility <- 1 - entropy
+  weights <- utility / sum(utility)
+  return(weights)
+}
+
+w <- entropy_weights(metrics)
+cat("Entropy weights:", w, "\n")
+
+node_importance$Entropy_Importance <- metrics %*% w
+node_importance <- node_importance %>% arrange(desc(Entropy_Importance))
+
+# -------------------------- 7.  SAVE IMPORTANCE TABLE -----------------------
+write.xlsx(node_importance,
+           file = file.path(output_dir, "Node_Importance.xlsx"),
+           rowNames = FALSE)
+
+# -------------------------- 8.  ATTACK SIMULATIONS --------------------------
+# 8a  Importance-based attack (high → low)
+g_imp <- g
+attack_order <- node_importance$ID_Node
+results_imp <- data.frame(Removal = 0,
+                          Removed_Nodes = "None",
+                          Robustness = 1,
+                          Method = "Importance")
+
+for(i in seq_along(attack_order)){
+  g_imp <- delete_vertices(g_imp, V(g_imp)$name == attack_order[i])
+  N  <- vcount(g_imp)
+  R  <- ifelse(N > 0, max(components(g_imp)$csize)/total_nodes, 0)
+  results_imp <- rbind(results_imp,
+                       data.frame(Removal        = i/total_nodes*100,
+                                  Removed_Nodes  = attack_order[i],
+                                  Robustness     = R,
+                                  Method         = "Importance"))
+  if(N == 0) break
+}
+
+write.xlsx(results_imp,
+           file = file.path(output_dir, "Attack_Importance.xlsx"),
+           rowNames = FALSE)
+
+# 8b  Habitat-Quality attack (low → high)
+g_hq <- g
+hq_order <- nodes_data %>% arrange(HQ) %>% pull(ID_Node)
+results_hq <- data.frame(Removal = 0,
+                         Removed_Nodes = "None",
+                         Robustness = 1,
+                         Method = "HQ_Low_High")
+
+for(i in seq_along(hq_order)){
+  g_hq <- delete_vertices(g_hq, V(g_hq)$name == hq_order[i])
+  N  <- vcount(g_hq)
+  R  <- ifelse(N > 0, max(components(g_hq)$csize)/total_nodes, 0)
+  results_hq <- rbind(results_hq,
+                      data.frame(Removal        = i/total_nodes*100,
+                                 Removed_Nodes  = hq_order[i],
+                                 Robustness     = R,
+                                 Method         = "HQ_Low_High"))
+  if(N == 0) break
+}
+
+write.xlsx(results_hq,
+           file = file.path(output_dir, "Attack_HQ.xlsx"),
+           rowNames = FALSE)
+
+# -------------------------- 9.  VISUALISE CURVES ----------------------------
+attack_curves <- bind_rows(results_imp, results_hq)
+
+p <- ggplot(attack_curves, aes(x = Removal, y = Robustness, color = Method)) +
+     geom_line(size = 0.7) +
+     geom_point(size = 1, alpha = 0.8) +
+     scale_color_manual(values = c("#2E86C1", "#E74C3C"),
+                        labels = c("Importance-based", "HQ low→high")) +
+     labs(x = "Node removal ratio (%)",
+          y = "Largest component ratio") +
+     theme_bw(base_size = 12)
+
+ggsave(filename = file.path(output_dir, "Attack_Curves.png"),
+       plot = p, width = 6, height = 4, dpi = 300)
+
+# -------------------------- 10.  CALCULATE AUC ------------------------------
+calc_auc <- function(df){
+  x <- df$Removal / 100
+  y <- df$Robustness
+  ord <- order(x)
+  sum(diff(x[ord]) * (head(y[ord], -1) + tail(y[ord], -1)) / 2)
+}
+
+auc_df <- tibble(
+  Method = c("Importance", "HQ_Low_High"),
+  AUC    = round(c(calc_auc(results_imp), calc_auc(results_hq)), 4)
+)
+
+write.xlsx(auc_df,
+           file = file.path(output_dir, "AUC_Summary.xlsx"),
+           rowNames = FALSE)
+
+cat("AUC summary:\n")
+print(auc_df)
