@@ -1,0 +1,137 @@
+# ============================================================================
+#  Eco-Spatial Network Resilience under Random Attacks
+#  Author:  DengZhiwei123
+#  GitHub:  https://github.com/DengZhiwei123/Random attacks: structural and functional resilience of ESNs
+# ============================================================================
+
+#  ---------- 1.  PACKAGES & PATHS (USER-ADJUSTED) ----------
+library(readxl); library(igraph); library(dplyr); library(ggplot2); library(openxlsx)
+
+# >>>  Replace with your own public-ready paths  <<<
+EDGE_FILE <- "YOUR_DATA/edges.xlsx"
+NODE_FILE <- "YOUR_DATA/nodes.xlsx"
+OUT_DIR   <- "YOUR_OUTPUT/random_attack"
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# ---------- 2.  LOAD DATA ----------
+edges_data <- read_excel(EDGE_FILE)
+nodes_data <- read_excel(NODE_FILE)
+total_nodes <- nrow(nodes_data)   # original network size
+
+# ---------- 3.  STRUCTURAL  RESILIENCE: single run (0-100 %) ----------
+structural_random <- function(seed){
+  set.seed(seed)
+  g <- graph_from_data_frame(edges_data, directed = FALSE, vertices = nodes_data) %>%
+        set_edge_attr("weight", value = edges_data$weight)
+  attack_order <- sample(nodes_data$ID_Node)
+  
+  removal_pct <- numeric()
+  robustness  <- numeric()
+  
+  for(i in seq_along(attack_order)){
+    g <- delete_vertices(g, which(V(g)$name == attack_order[i]))
+    R <- if(vcount(g) > 0) max(components(g)$csize) / total_nodes else 0
+    removal_pct <- c(removal_pct, i / total_nodes * 100)
+    robustness  <- c(robustness, R)
+    if(vcount(g) == 0) break
+  }
+  approx(removal_pct, robustness, xout = 0:100, rule = 2)$y
+}
+
+# ---------- 4.  FUNCTIONAL RESILIENCE: single run (0-100 %) ----------
+# helper functions
+weighted_global_efficiency <- function(g){
+  n <- vcount(g); if(n < 2) return(0)
+  shortest_paths <- distances(g, weights = 1/E(g)$weight)
+  eff_mat <- 1 / shortest_paths
+  eff_mat[is.infinite(eff_mat)] <- 0
+  sum(eff_mat) / (n * (n - 1))
+}
+
+weighted_clustering_coefficient <- function(g){
+  n <- vcount(g); if(n == 0) return(0)
+  C_w <- numeric(n)
+  for(i in V(g)){
+    nb <- neighbors(g, i)
+    if(length(nb) < 2){C_w[i] <<- 0; next}
+    w_i <- sapply(nb, function(j) E(g)[i %--% j]$weight)
+    num <- 0
+    for(j_idx in 1:(length(nb)-1)){
+      for(k_idx in (j_idx+1):length(nb)){
+        w_jk <- E(g)[nb[j_idx] %--% nb[k_idx]]$weight
+        if(length(w_jk) == 0) w_jk <- 0
+        num <- num + w_i[j_idx]*w_i[k_idx]*w_jk
+      }
+    }
+    den <- sum(w_i)^2 - sum(w_i^2)
+    C_w[i] <<- ifelse(den > 0, num/den, 0)
+  }
+  mean(C_w, na.rm = TRUE)
+}
+
+functional_random <- function(seed){
+  set.seed(seed)
+  g <- graph_from_data_frame(edges_data, directed = FALSE, vertices = nodes_data) %>%
+        set_edge_attr("weight", value = edges_data$weight)
+  attack_order <- sample(nodes_data$ID_Node)
+  
+  removal_pct <- numeric()
+  resilience  <- numeric()
+  
+  for(i in seq_along(attack_order)){
+    g <- delete_vertices(g, which(V(g)$name == attack_order[i]))
+    rem_nodes <- V(g)$name
+    hq_area <- sum(nodes_data$HQ[match(rem_nodes, nodes_data$ID_Node)] *
+                   nodes_data$area[match(rem_nodes, nodes_data$ID_Node)], na.rm = TRUE)
+    eff  <- weighted_global_efficiency(g)
+    clust <- weighted_clustering_coefficient(g)
+    resilience <- c(resilience, hq_area * eff * clust)
+    removal_pct <- c(removal_pct, i / total_nodes * 100)
+    if(vcount(g) == 0) break
+  }
+  approx(removal_pct, resilience, xout = 0:100, rule = 2)$y
+}
+
+# ---------- 5.  MONTE-CARLO SIMULATION ----------
+n_sim <- 100
+set.seed(123456)   # reproducible
+struct_matrix <- sapply(1:n_sim, function(i){
+  cat("Structural random replicate", i, "\n")
+  structural_random(i)
+})
+func_matrix   <- sapply(1:n_sim, function(i){
+  cat("Functional random replicate", i, "\n")
+  functional_random(i)
+})
+
+# ---------- 6.  95 % CONFIDENCE INTERVALS ----------
+summarise_matrix <- function(mat){
+  data.frame(
+    Removal = 0:100,
+    Mean    = apply(mat, 1, mean,   na.rm = TRUE),
+    Lower   = apply(mat, 1, quantile, probs = 0.025, na.rm = TRUE),
+    Upper   = apply(mat, 1, quantile, probs = 0.975, na.rm = TRUE)
+  )
+}
+
+struct_ci <- summarise_matrix(struct_matrix)
+func_ci   <- summarise_matrix(func_matrix)
+
+# ---------- 7.  EXPORT ----------
+write.xlsx(struct_ci, file.path(OUT_DIR, "structural_resilience_95CI.xlsx"), rowNames = FALSE)
+write.xlsx(func_ci,   file.path(OUT_DIR, "functional_resilience_95CI.xlsx"), rowNames = FALSE)
+
+# ---------- 8.  VISUALISE ----------
+plot_ci <- function(df, y_lab, title_lab){
+  ggplot(df, aes(x = Removal)) +
+    geom_ribbon(aes(ymin = Lower, ymax = Upper), fill = "#4A90E2", alpha = 0.3) +
+    geom_line(aes(y = Mean), colour = "#2B5797", linewidth = 1) +
+    labs(x = "Node removal ratio (%)", y = y_lab, title = title_lab) +
+    theme_bw(base_size = 14)
+}
+
+p_struct <- plot_ci(struct_ci, "Largest component ratio", "Structural resilience under random attacks (95 % CI)")
+p_func   <- plot_ci(func_ci,   "Functional resilience",   "Functional resilience under random attacks (95 % CI)")
+
+ggsave(filename = file.path(OUT_DIR, "structural_95CI.png"), plot = p_struct, width = 6, height = 4, dpi = 300)
+ggsave(filename = file.path(OUT_DIR, "functional_95CI.png"), plot = p_func,   width = 6, height = 4, dpi = 300)
